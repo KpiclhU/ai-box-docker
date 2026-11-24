@@ -1,0 +1,38 @@
+#cloud-config
+# Docker VM for the ai-docker stack.
+#
+# Installed as a Proxmox snippet by proxmox/create-vm.sh, which also sets the
+# static address, the admin user and the SSH keys. Nothing here knows the IP.
+hostname: docker-vm
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+package_update: true
+package_upgrade: false
+
+write_files:
+  - path: /usr/local/sbin/ai-docker-bootstrap
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Docker Engine + compose plugin from Docker's own repository, then the
+      # directory the stack is copied into.
+      set -eu
+      apt-get install -y --no-install-recommends ca-certificates curl gnupg jq git
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      . /etc/os-release
+      printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+        "$(dpkg --print-architecture)" "$VERSION_CODENAME" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+      mkdir -p /opt/ai-docker
+      chown 1000:1000 /opt/ai-docker
+
+runcmd:
+  - /usr/local/sbin/ai-docker-bootstrap
+
+final_message: "docker-vm is up in $UPTIME s. Copy the stack in and run sudo ./install.sh."

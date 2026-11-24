@@ -1,0 +1,11 @@
+# Local state: the answers and secrets generated on this machine
+.env
+open-webui.env
+openclaw/
+
+# Python / editor / OS scratch
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db

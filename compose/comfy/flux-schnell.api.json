@@ -1,0 +1,83 @@
+{
+  "10": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "flux1-schnell-fp8-e4m3fn.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": { "title": "Load Diffusion Model" }
+  },
+  "11": {
+    "class_type": "DualCLIPLoader",
+    "inputs": {
+      "clip_name1": "t5xxl_fp8_e4m3fn.safetensors",
+      "clip_name2": "clip_l.safetensors",
+      "type": "flux"
+    },
+    "_meta": { "title": "Dual CLIP Loader" }
+  },
+  "12": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "_meta": { "title": "VAE Loader" }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "a corgi astronaut floating above a ringed planet, cinematic lighting",
+      "clip": ["11", 0]
+    },
+    "_meta": { "title": "Positive Prompt" }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": ["11", 0]
+    },
+    "_meta": { "title": "Negative Prompt (unused at cfg 1)" }
+  },
+  "27": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": { "title": "Empty Latent Image" }
+  },
+  "3": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 42,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["10", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["27", 0]
+    },
+    "_meta": { "title": "KSampler (4-step schnell)" }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["3", 0],
+      "vae": ["12", 0]
+    },
+    "_meta": { "title": "VAE Decode" }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "openwebui-flux",
+      "images": ["8", 0]
+    },
+    "_meta": { "title": "Save Image" }
+  }
+}
