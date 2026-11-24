@@ -77,7 +77,66 @@ mkdir -p openclaw
 chown 1000:1000 openclaw
 chmod 755 openclaw
 
-# ---- 5. the host-side shim, and a unit so it survives a reboot --------------
+# ---- 5. openclaw's config, written before the gateway is ever started -------
+# The gateway exits 78 (EX_CONFIG) instead of guessing gateway.mode, so an empty
+# state directory is not "unconfigured", it is "invalid" — it would restart forever.
+llama_url="$(get LLAMA_URL)"; llama_url="${llama_url:-http://192.168.150.40:8080/v1}"
+llama_key="$(get LLAMA_API_KEY)"; llama_key="${llama_key:-none}"
+claw_ip="$(get OPENCLAW_IP)";   claw_ip="${claw_ip:-192.168.150.53}"
+claw_cfg="$PWD/openclaw/openclaw.json"
+
+first_model() { # the id llama-server is serving, straight from /v1/models
+  local json
+  json="$(curl -fsS --max-time 10 "${llama_url%/}/models" 2>/dev/null)" || return 1
+  if have python3; then
+    printf '%s' "$json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null && return 0
+  fi
+  if have jq; then
+    printf '%s' "$json" | jq -er '.data[0].id' 2>/dev/null && return 0
+  fi
+  printf '%s' "$json" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+# A one-off `run` keeps the service's static address, so the long-running
+# container must not be holding it while onboarding runs.
+docker compose stop openclaw >/dev/null 2>&1 || true
+
+if [ -f "$claw_cfg" ]; then
+  echo "openclaw: openclaw.json already exists, leaving its provider alone"
+else
+  model="${LLAMA_MODEL:-}"
+  [ -n "$model" ] || model="$(first_model || true)"
+  if [ -z "$model" ]; then
+    echo "warning: no model from ${llama_url%/}/models — OpenClaw is left stopped" >&2
+    echo "         start ai-box and re-run, or set LLAMA_MODEL=<id>" >&2
+  else
+    say "Onboarding OpenClaw against $llama_url (model $model)"
+    docker compose run -T --rm --no-deps --entrypoint node openclaw \
+      dist/index.js onboard --non-interactive --accept-risk --skip-health \
+        --mode local \
+        --auth-choice llama-cpp-existing-server \
+        --custom-base-url "${llama_url#*://}" \
+        --custom-model-id "$model" \
+        --llama-server-api-key "$llama_key" \
+        --gateway-auth token --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
+        --gateway-bind lan \
+        --skip-channels --no-install-daemon
+  fi
+fi
+
+if [ -f "$claw_cfg" ]; then
+  # The control UI is opened at the container's own LAN address, which is not
+  # loopback, so it has to be listed. Re-applied on every run.
+  origins="[\"http://$claw_ip:18789\",\"http://localhost:18789\",\"http://127.0.0.1:18789\"]"
+  batch="[{\"path\":\"gateway.mode\",\"value\":\"local\"},{\"path\":\"gateway.bind\",\"value\":\"lan\"},{\"path\":\"gateway.controlUi.allowedOrigins\",\"value\":$origins}]"
+  docker compose run -T --rm --no-deps --entrypoint node openclaw \
+    dist/index.js config set --batch-json "$batch"
+  claw_ready=1
+else
+  claw_ready=0
+fi
+
+# ---- 6. the host-side shim, and a unit so it survives a reboot --------------
 ENV_FILE="$PWD/.env" bash ./shim.sh up
 cat > /etc/systemd/system/ai-docker-shim.service <<EOF
 [Unit]
@@ -98,9 +157,22 @@ EOF
 systemctl daemon-reload
 systemctl enable ai-docker-shim.service >/dev/null 2>&1 || true
 
-# ---- 6. the stack -----------------------------------------------------------
+# ---- 7. the stack -----------------------------------------------------------
 say "Starting the stack"
-docker compose up -d --remove-orphans
+if [ "${claw_ready:-0}" = 1 ]; then
+  docker compose up -d --remove-orphans
+else
+  echo "openclaw has no config yet — starting the other two services only" >&2
+  docker compose up -d --remove-orphans open-webui open-terminal
+fi
+
+if [ "${claw_ready:-0}" = 1 ]; then
+  claw_next="  3. OpenClaw was onboarded against $llama_url during this run:
+     http://$claw_ip:18789 — paste the gateway token above."
+else
+  claw_next="  3. OpenClaw is stopped until ai-box answers on $llama_url:
+     start it, then re-run sudo ./install.sh to onboard."
+fi
 
 webui_ip="$(get OPENWEBUI_IP)";       webui_ip="${webui_ip:-192.168.150.51}"
 term_ip="$(get OPEN_TERMINAL_IP)";    term_ip="${term_ip:-192.168.150.52}"
@@ -120,7 +192,9 @@ wait_for() { # <url> <label>
 say "Waiting for the services"
 wait_for "http://$webui_ip:8080/health" "open-webui"  || echo "    docker compose logs --tail=30 open-webui" >&2
 wait_for "http://$term_ip:8000/docs"    "open-terminal" || echo "    docker compose logs --tail=30 open-terminal" >&2
-wait_for "http://$claw_ip:18789/"       "openclaw"    || echo "    docker compose logs --tail=30 openclaw" >&2
+if [ "${claw_ready:-0}" = 1 ]; then
+  wait_for "http://$claw_ip:18789/"     "openclaw"    || echo "    docker compose logs --tail=30 openclaw" >&2
+fi
 
 cat <<EOF
 
@@ -135,10 +209,8 @@ cat <<EOF
 Next:
   1. Sign in to Open WebUI, change the admin password, create one account per
      person (Admin -> Settings -> Users), then Admin -> Settings -> Connections
-     should already list ${LLAMA_URL:-http://192.168.150.40:8080/v1}.
+     should already list $llama_url.
   2. Add the terminal: Admin -> Settings -> Integrations -> Terminal -> +,
      URL http://$term_ip:8000, key above, auth Bearer.
-  3. Finish OpenClaw: docker compose run --rm --no-deps --entrypoint node \\
-       openclaw dist/index.js onboard --mode local --no-install-daemon
-     and point its model provider at the same llama-server URL.
+  ${claw_next}
 EOF

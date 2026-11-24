@@ -123,9 +123,15 @@ In order, it:
 3. writes `open-webui.env` with the SDXL graph minified onto one line, so the first image
    needs no import in the UI;
 4. creates `openclaw/` owned by **uid 1000**, which is what that image runs as;
-5. brings up the macvlan shim and a systemd unit so it survives a reboot;
-6. `docker compose up -d`, then waits for all three to answer and prints the addresses and
-   the generated keys.
+5. onboards OpenClaw *before* it is ever started. The gateway exits 78 (`EX_CONFIG`) rather
+   than guess its own mode, so an empty state directory is not "unconfigured", it is invalid.
+   It reads the model id from `LLAMA_URL`'s `/v1/models` (override with
+   `sudo LLAMA_MODEL=<id> ./install.sh`), then writes `gateway.mode=local`, `gateway.bind=lan`,
+   the token as an `env` SecretRef and the LAN origin in `gateway.controlUi.allowedOrigins`.
+   If ai-box is not answering it skips OpenClaw and starts the other two;
+6. brings up the macvlan shim and a systemd unit so it survives a reboot;
+7. `docker compose up -d`, then waits for the services and prints the addresses and the
+   generated keys.
 
 Re-run it after editing `.env`. `docker compose up -d` alone is enough for an image tag
 change.
@@ -143,16 +149,36 @@ for one account per person (`ENABLE_SIGNUP=false`). The model connection is alre
 any machine on the LAN: `http://192.168.150.52:8000/docs`.
 
 **OpenClaw** — `http://192.168.150.53:18789`, paste `OPENCLAW_GATEWAY_TOKEN` into Settings.
-Finish onboarding first:
+`install.sh` has already onboarded it against `http://192.168.150.40:8080/v1` with that token
+as an `env` SecretRef, so there is no wizard to finish. llama-server does not check the key, so
+the value passed as `LLAMA_API_KEY` (`none` by default) is only a placeholder.
 
-```bash
-docker compose run --rm --no-deps --entrypoint node openclaw \
-  dist/index.js onboard --mode local --no-install-daemon
+If the container keeps restarting instead, this is the failure to expect and what it means:
+
+```
+[gateway] startup phase: cli.main.gateway-run-bootstrap ... failed
+exited with code 78 (restarting)
 ```
 
-Its model provider should be an OpenAI-compatible endpoint with base URL
-`http://192.168.150.40:8080/v1`; llama-server does not check the key, so any non-empty value
-works.
+78 is `EX_CONFIG` — an invalid or missing `openclaw.json`, never a crash — and OpenClaw keeps
+the code deliberately so a supervisor does not hammer a broken config. `docker compose logs
+--tail=40 openclaw` says which key it rejected. To onboard by hand, from `compose/`:
+
+```bash
+curl -s http://192.168.150.40:8080/v1/models   # take an id from here
+MODEL=<that id>
+docker compose run -T --rm --no-deps --entrypoint node openclaw \
+  dist/index.js onboard --non-interactive --accept-risk --skip-health --mode local \
+  --auth-choice llama-cpp-existing-server --custom-base-url 192.168.150.40:8080/v1 \
+  --custom-model-id "$MODEL" --gateway-auth token \
+  --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN --gateway-bind lan \
+  --skip-channels --no-install-daemon
+docker compose up -d openclaw
+```
+
+`gateway.controlUi.allowedOrigins` must include `http://192.168.150.53:18789`; without it the
+Control UI loads but refuses to connect, because that address is not loopback. `install.sh`
+sets it, and re-running it re-applies it without touching the model provider.
 
 ## Operations
 
@@ -192,8 +218,10 @@ ai-docker-shim`).
 
 ## Honest status
 
-Everything here is written against the projects' published Docker instructions but **none of it
-has been run**: no VM has been created, `docker compose up` has never executed these files, and
-the macvlan addresses, the shim and the three first-run flows are all untested. Treat the first
-run as supervised, and read `docker compose logs` before assuming a service is happy just
-because the container is `Up`.
+Everything here is written against the projects' published Docker instructions and **almost none
+of it has been run**: the macvlan addresses, the shim and the Open WebUI and Open Terminal
+first-run flows are untested, and `create-vm.sh` has never created a VM. The one thing that has
+now run for real is OpenClaw — and it exited 78 on an empty state directory, exactly as the
+"no config" case predicts. Step 5 above and the onboarding in `install.sh` are the fix for
+that; they are themselves unrun, so treat the OpenClaw start as the part to watch first. Read
+`docker compose logs` before assuming a service is happy because the container is `Up`.
