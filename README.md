@@ -128,7 +128,12 @@ In order, it:
    It reads the model id from `LLAMA_URL`'s `/v1/models` (override with
    `sudo LLAMA_MODEL=<id> ./install.sh`), then writes `gateway.mode=local`, `gateway.bind=lan`,
    the token as an `env` SecretRef and the LAN origin in `gateway.controlUi.allowedOrigins`.
-   If ai-box is not answering it skips OpenClaw and starts the other two;
+   A config that exists but has **no** `gateway.mode` is treated as damaged — it is backed up
+   to `openclaw.json.bak.*` and repaired with `onboard --reset --reset-scope config`, which
+   keeps credentials and sessions but rewrites the config. `gateway.mode` is then read back off
+   the bind mount: if onboarding did not actually write it, OpenClaw is left **stopped** rather
+   than started into the restart loop. If ai-box is not answering it skips OpenClaw and starts
+   the other two;
 6. brings up the macvlan shim and a systemd unit so it survives a reboot;
 7. `docker compose up -d`, then waits for the services and prints the addresses and the
    generated keys.
@@ -167,14 +172,25 @@ the code deliberately so a supervisor does not hammer a broken config. `docker c
 ```bash
 curl -s http://192.168.150.40:8080/v1/models   # take an id from here
 MODEL=<that id>
+docker compose stop openclaw
+cp -a openclaw/openclaw.json openclaw/openclaw.json.bak
+set -a; . ./.env; set +a        # the gateway token ref must be in this shell/env
 docker compose run -T --rm --no-deps --entrypoint node openclaw \
   dist/index.js onboard --non-interactive --accept-risk --skip-health --mode local \
-  --auth-choice llama-cpp-existing-server --custom-base-url 192.168.150.40:8080/v1 \
+  --auth-choice llama-cpp-existing-server --custom-base-url http://192.168.150.40:8080/v1 \
   --custom-model-id "$MODEL" --gateway-auth token \
   --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN --gateway-bind lan \
-  --skip-channels --no-install-daemon
+  --reset --reset-scope config --skip-channels --no-install-daemon
+# trust nothing until the file says so:
+docker compose run -T --rm --no-deps --entrypoint node openclaw \
+  dist/index.js config get gateway.mode        # must print local
 docker compose up -d openclaw
 ```
+
+`--reset --reset-scope config` is what clears a damaged config; without it a config the gateway
+has already rejected stays rejected. If the file keeps coming back without `gateway.mode`, move
+the directory aside and start clean: `mv openclaw openclaw.damaged && mkdir openclaw && sudo
+chown 1000:1000 openclaw`, then run the block above **without** `--reset`.
 
 `gateway.controlUi.allowedOrigins` must include `http://192.168.150.53:18789`; without it the
 Control UI loads but refuses to connect, because that address is not loopback. `install.sh`
@@ -220,8 +236,13 @@ ai-docker-shim`).
 
 Everything here is written against the projects' published Docker instructions and **almost none
 of it has been run**: the macvlan addresses, the shim and the Open WebUI and Open Terminal
-first-run flows are untested, and `create-vm.sh` has never created a VM. The one thing that has
-now run for real is OpenClaw — and it exited 78 on an empty state directory, exactly as the
-"no config" case predicts. Step 5 above and the onboarding in `install.sh` are the fix for
-that; they are themselves unrun, so treat the OpenClaw start as the part to watch first. Read
-`docker compose logs` before assuming a service is happy because the container is `Up`.
+first-run flows are untested, and `create-vm.sh` has never created a VM.
+
+OpenClaw has run for real, twice, and both times it exited 78 — first on an empty state
+directory, then on a state directory holding a config with no `gateway.mode` that onboarding
+had never written, which the first fix's "openclaw.json already exists" branch then skipped
+past. Both causes are now handled: section 5 onboards before the first start, detects a config
+without `gateway.mode`, repairs it with `--reset --reset-scope config`, and refuses to start
+the service unless the key is verifiably in the file. That logic is itself still unrun, so
+treat the OpenClaw start as the part to watch: read `docker compose logs --tail=60 openclaw`
+before assuming a service is happy because the container is `Up`.

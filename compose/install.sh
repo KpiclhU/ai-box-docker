@@ -81,6 +81,7 @@ chmod 755 openclaw
 # The gateway exits 78 (EX_CONFIG) instead of guessing gateway.mode, so an empty
 # state directory is not "unconfigured", it is "invalid" — it would restart forever.
 llama_url="$(get LLAMA_URL)"; llama_url="${llama_url:-http://192.168.150.40:8080/v1}"
+case "$llama_url" in http://*|https://*) ;; *) llama_url="http://$llama_url" ;; esac
 llama_key="$(get LLAMA_API_KEY)"; llama_key="${llama_key:-none}"
 claw_ip="$(get OPENCLAW_IP)";   claw_ip="${claw_ip:-192.168.150.53}"
 claw_cfg="$PWD/openclaw/openclaw.json"
@@ -97,43 +98,97 @@ first_model() { # the id llama-server is serving, straight from /v1/models
   printf '%s' "$json" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 
+claw_mode() { # gateway.mode as it is actually written in openclaw.json
+  [ -f "$claw_cfg" ] || return 0
+  if have python3; then
+    python3 - "$claw_cfg" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+mode = (cfg.get("gateway") or {}).get("mode")
+print(mode if isinstance(mode, str) else "")
+PY
+  else
+    docker compose run -T --rm --no-deps --entrypoint node openclaw \
+      --input-type=commonjs -e \
+      'const fs=require("fs");try{const c=JSON.parse(fs.readFileSync("/home/node/.openclaw/openclaw.json","utf8"));process.stdout.write(String((c.gateway||{}).mode||""))}catch(e){}' \
+      2>/dev/null || true
+  fi
+}
+
+onboard() { # <model> [extra onboard flags...]
+  docker compose run -T --rm --no-deps --entrypoint node openclaw \
+    dist/index.js onboard --non-interactive --accept-risk --skip-health \
+      --mode local \
+      --auth-choice llama-cpp-existing-server \
+      --custom-base-url "$llama_url" \
+      --custom-model-id "$1" \
+      --llama-server-api-key "$llama_key" \
+      --gateway-auth token --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
+      --gateway-bind lan \
+      --skip-channels --no-install-daemon "${@:2}"
+}
+
 # A one-off `run` keeps the service's static address, so the long-running
 # container must not be holding it while onboarding runs.
 docker compose stop openclaw >/dev/null 2>&1 || true
 
-if [ -f "$claw_cfg" ]; then
-  echo "openclaw: openclaw.json already exists, leaving its provider alone"
+# gateway.mode is onboarding's to write: the gateway refuses to guess it, so a
+# config without one — a stub from an older container, or a write that was
+# rejected wholesale (see openclaw.json.rejected.*) — is damaged, not unfilled.
+# Starting against it only buys an endless "exited with code 78".
+mode="$(claw_mode)"
+claw_ready=0
+if [ -n "$mode" ]; then
+  echo "openclaw: openclaw.json already declares gateway.mode=$mode, leaving its provider alone"
+  claw_ready=1
 else
   model="${LLAMA_MODEL:-}"
   [ -n "$model" ] || model="$(first_model || true)"
   if [ -z "$model" ]; then
     echo "warning: no model from ${llama_url%/}/models — OpenClaw is left stopped" >&2
     echo "         start ai-box and re-run, or set LLAMA_MODEL=<id>" >&2
+  elif [ -f "$claw_cfg" ]; then
+    echo "openclaw: $claw_cfg has no gateway.mode — repairing it" >&2
+    cp -a "$claw_cfg" "$claw_cfg.bak.$(date +%Y%m%d-%H%M%S)"
+    say "Onboarding OpenClaw against $llama_url (model $model, repairing config)"
+    onboard "$model" --reset --reset-scope config \
+      || echo "warning: onboarding exited non-zero (see above)" >&2
+    if [ -z "$(claw_mode)" ]; then
+      # --reset needs readable config and SQLite; if it could not repair the
+      # directory, set it aside rather than starting against it.
+      echo "openclaw: reset could not repair the state directory — moving it aside" >&2
+      mv openclaw "openclaw.damaged.$(date +%Y%m%d-%H%M%S)"
+      mkdir -p openclaw
+      chown 1000:1000 openclaw
+      chmod 755 openclaw
+      onboard "$model" || echo "warning: onboarding exited non-zero (see above)" >&2
+    fi
   else
     say "Onboarding OpenClaw against $llama_url (model $model)"
-    docker compose run -T --rm --no-deps --entrypoint node openclaw \
-      dist/index.js onboard --non-interactive --accept-risk --skip-health \
-        --mode local \
-        --auth-choice llama-cpp-existing-server \
-        --custom-base-url "${llama_url#*://}" \
-        --custom-model-id "$model" \
-        --llama-server-api-key "$llama_key" \
-        --gateway-auth token --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
-        --gateway-bind lan \
-        --skip-channels --no-install-daemon
+    onboard "$model" || echo "warning: onboarding exited non-zero (see above)" >&2
+  fi
+
+  mode="$(claw_mode)"
+  if [ -n "$mode" ]; then
+    claw_ready=1
+  else
+    echo "warning: onboarding did not write gateway.mode — OpenClaw stays stopped" >&2
+    echo "         (starting it now would only restart-loop on exit 78)" >&2
+    echo "         docker compose logs --tail=40 openclaw; ls openclaw/openclaw.json.rejected.*" >&2
   fi
 fi
 
-if [ -f "$claw_cfg" ]; then
+if [ "$claw_ready" -eq 1 ]; then
   # The control UI is opened at the container's own LAN address, which is not
-  # loopback, so it has to be listed. Re-applied on every run.
+  # loopback, so it has to be listed. Re-applied on every run; a rejected write
+  # leaves the config untouched, so this cannot break a working gateway.
   origins="[\"http://$claw_ip:18789\",\"http://localhost:18789\",\"http://127.0.0.1:18789\"]"
-  batch="[{\"path\":\"gateway.mode\",\"value\":\"local\"},{\"path\":\"gateway.bind\",\"value\":\"lan\"},{\"path\":\"gateway.controlUi.allowedOrigins\",\"value\":$origins}]"
   docker compose run -T --rm --no-deps --entrypoint node openclaw \
-    dist/index.js config set --batch-json "$batch"
-  claw_ready=1
-else
-  claw_ready=0
+    dist/index.js config set gateway.controlUi.allowedOrigins "$origins" --strict-json \
+    || echo "warning: could not add http://$claw_ip:18789 to gateway.controlUi.allowedOrigins — the Control UI will load but refuse to connect; add it in openclaw/openclaw.json by hand" >&2
 fi
 
 # ---- 6. the host-side shim, and a unit so it survives a reboot --------------
